@@ -20,6 +20,5 @@
       }
     }
   },
-  "postCreateCommand": "pip install --upgrade pip && pip install -r requirements.txt",
-  "forwardPorts":  // Neo4j Bolt, potential web UI
+  "postCreateCommand": "pip install --upgrade pip && pip install -r requirements.txt"
 }
