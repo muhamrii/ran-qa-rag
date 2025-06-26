@@ -12,6 +12,7 @@ __pycache__/
 *.sqlite
 *.log
 
+
 # Data files
 *.csv
 *.xml

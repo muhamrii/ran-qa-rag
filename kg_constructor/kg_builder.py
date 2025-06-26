@@ -32,7 +32,7 @@ class LocalLLM:
     """
     Simple wrapper for Hugging Face text-generation pipeline to mimic OpenAI's interface.
     """
-    def __init__(self, model_name="mistralai/Mistral-7B-Instruct-v0.2", max_new_tokens=512):
+    def __init__(self, model_name="facebook/opt-1.3b", max_new_tokens=512):
         self.generator = pipeline("text-generation", model=model_name, device_map="auto")
         self.max_new_tokens = max_new_tokens
 
@@ -72,10 +72,7 @@ def describe_tables(dfs: Dict[str, pd.DataFrame], llm: LocalLLM) -> Dict[str, st
             summary.append(f"- {col} (dtype={df[col].dtype}, sample={sample})")
         
         prompt = (
-            "You are a telecommunications data expert. "
-            "Given the table schema and sample values below, generate:\n"
-            "1) A concise summary of the table's purpose in the RAN domain.\n"
-            "2) One-line description for each column.\n\n"
+            "You are a data expert. Given the table schema below, generate a one-line description of the table and each column.\n"
             + "\n".join(summary)
         )
         response = llm(prompt)
@@ -87,7 +84,7 @@ def describe_tables(dfs: Dict[str, pd.DataFrame], llm: LocalLLM) -> Dict[str, st
 # --------------------------------------------------
 # Entity & Relationship Extraction
 # --------------------------------------------------
-def extract_entities_and_relations(descriptions: Dict[str, str], llm: OpenAI) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def extract_entities_and_relations(descriptions: Dict[str, str], llm: LocalLLM) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     prompt = (
         "You are a graph modeling expert. Given the following table descriptions, "
         "1) Identify core entity types and their key properties. "
