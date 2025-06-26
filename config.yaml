@@ -2,5 +2,3 @@ neo4j:
     uri: bolt://localhost:7687
     user: neo4j
     password: your_password
-openai:
-    api_key: sk-...
