@@ -10,21 +10,6 @@ from transformers import pipeline
 # from langchain.embeddings import OpenAIEmbeddings  # Uncomment if embeddings are needed
 #from neo4j import GraphDatabase
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
-# CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../config.yaml")
-# if os.path.exists(CONFIG_PATH):
-#     with open(CONFIG_PATH, "r") as f:
-#         config = yaml.safe_load(f)
-#     NEO4J_URI = config["neo4j"]["uri"]
-#     NEO4J_USER = config["neo4j"]["user"]
-#     NEO4J_PASS = config["neo4j"]["password"]
-# else:
-#     raise FileNotFoundError(f"Config file not found at {CONFIG_PATH}")
-
-CACHE_DIR = os.getenv("KG_CACHE_DIR", ".kg_cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
 
 
 ### LOCAL LLM WRAPPER
@@ -39,6 +24,58 @@ class LocalLLM:
     def __call__(self, prompt):
         response = self.generator(prompt, max_new_tokens=self.max_new_tokens, do_sample=True)
         return response[0]['generated_text'][len(prompt):].strip()
+
+# --------------------------------------------------
+# Google AI Studio LLM Wrapper (Gemini 1.5 Flash, no-cost tier)
+# --------------------------------------------------
+import requests
+
+class GoogleAIStudioLLM:
+    """
+    Wrapper for Google AI Studio API (Gemini 1.5 Flash, no-cost tier).
+    """
+    def __init__(self, api_key: str, model: str = "gemini-1.5-flash-latest"):
+        self.api_key = api_key
+        self.model = model
+        self.endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+
+    def __call__(self, prompt: str) -> str:
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
+        data = {
+            "contents": [{"parts": [{"text": prompt}]}]
+        }
+        response = requests.post(self.endpoint, headers=headers, json=data)
+        response.raise_for_status()
+        result = response.json()
+        # Extract the generated text
+        return result["candidates"][0]["content"]["parts"][0]["text"].strip()
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+
+import yaml
+
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../config.yaml")
+if os.path.exists(CONFIG_PATH):
+    with open(CONFIG_PATH, "r") as f:
+        config = yaml.safe_load(f)
+    GOOGLE_API_KEY = config["google_ai_studio"]["api_key"]
+    GOOGLE_MODEL = config["google_ai_studio"].get("model", "gemini-1.5-flash-latest")
+    NEO4J_URI = config["neo4j"]["uri"]
+    NEO4J_USER = config["neo4j"]["user"]
+    NEO4J_PASS = config["neo4j"]["password"]
+else:
+    raise FileNotFoundError(f"Config file not found at {CONFIG_PATH}")
+
+# Usage:
+llm = GoogleAIStudioLLM(api_key=GOOGLE_API_KEY, model=GOOGLE_MODEL)
+
+CACHE_DIR = os.getenv("KG_CACHE_DIR", ".kg_cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 
 
 # --------------------------------------------------
@@ -55,7 +92,16 @@ def fingerprint_schema(df: pd.DataFrame) -> str:
 # --------------------------------------------------
 # Parser & Description
 # --------------------------------------------------
-def describe_tables(dfs: Dict[str, pd.DataFrame], llm: LocalLLM) -> Dict[str, str]:
+import time
+import requests
+from requests.exceptions import HTTPError
+
+def describe_tables(dfs: Dict[str, pd.DataFrame], llm: "GoogleAIStudioLLM") -> Dict[str, str]:
+    """
+    Describe tables using Google AI Studio LLM (Gemini 1.5 Flash, no-cost tier).
+    Handles rate limits by waiting and retrying on HTTP 429 errors.
+    Caches results to avoid repeated calls for the same data.
+    """
     descriptions = {}
     for name, df in dfs.items():
         fp = fingerprint_schema(df)
@@ -72,15 +118,35 @@ def describe_tables(dfs: Dict[str, pd.DataFrame], llm: LocalLLM) -> Dict[str, st
             summary.append(f"- {col} (dtype={df[col].dtype}, sample={sample})")
         
         prompt = (
-            "You are a data expert. Given the table schema below, generate a one-line description of the table and each column.\n"
+            "You are a data and radio access network telecommunication expert. Given the table schema below, generate a one-line description of the table and each column.\n"
             + "\n".join(summary)
         )
-        response = llm(prompt)
+
+        # Retry logic for rate limiting
+        max_retries = 5
+        retry_wait = 60  # seconds to wait after 429
+        for attempt in range(max_retries):
+            try:
+                response = llm(prompt)
+                break
+            except HTTPError as e:
+                if e.response is not None and e.response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        print(f"Rate limit hit (429). Waiting {retry_wait} seconds before retrying...")
+                        time.sleep(retry_wait)
+                        continue
+                    else:
+                        raise
+                else:
+                    raise
+        else:
+            raise RuntimeError("Max retries exceeded for LLM API.")
+
         descriptions[name] = response.strip()
         with open(cache_file, 'w') as f:
             json.dump({"schema_fp": fp, "description": response}, f)
+        time.sleep(2)  # Reduce frequency of requests
     return descriptions
-
 # --------------------------------------------------
 # Entity & Relationship Extraction
 # --------------------------------------------------
