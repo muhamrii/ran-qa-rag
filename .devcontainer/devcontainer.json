@@ -1,7 +1,7 @@
 {
   "name": "RAN QA & RAG System",
   "dockerComposeFile": [
-    "../docker-compose.yml"
+    "docker-compose.yml"
   ],
   "service": "devcontainer",
   "workspaceFolder": "/workspaces/ran-qa-rag",
