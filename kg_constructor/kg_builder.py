@@ -150,16 +150,124 @@ def describe_tables(dfs: Dict[str, pd.DataFrame], llm: "GoogleAIStudioLLM") -> D
 # --------------------------------------------------
 # Entity & Relationship Extraction
 # --------------------------------------------------
-def extract_entities_and_relations(descriptions: Dict[str, str], llm: LocalLLM) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    prompt = (
-        "You are a graph modeling expert. Given the following table descriptions, "
-        "1) Identify core entity types and their key properties. "
-        "2) Identify relationships between these entities. "
-        "\nDescriptions:\n" + json.dumps(descriptions, indent=2)
-    )
-    output = llm(prompt)
-    data = json.loads(output)
-    return data.get('entities', []), data.get('relationships', [])
+def extract_entities_and_relations(
+    descriptions: Dict[str, str],
+    llm: GoogleAIStudioLLM,
+    cache_dir: str = CACHE_DIR,
+    batch_size: int = 10
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Extract entities and relationships using Google AI Studio LLM (Gemini).
+    Handles large outputs by batching and merging results.
+    Caches results to avoid repeated calls for the same data.
+    Saves raw LLM output before attempting to extract JSON.
+    """
+    import re
+
+    # Ensure descriptions is a dict and all values are strings
+    if not isinstance(descriptions, dict):
+        raise TypeError(f"descriptions must be a dict, got {type(descriptions).__name__}: {descriptions}")
+    desc_serializable = {k: str(v) for k, v in descriptions.items()}
+
+    desc_fp = hashlib.md5(json.dumps(desc_serializable, sort_keys=True).encode('utf-8')).hexdigest()
+    cache_file = os.path.join(cache_dir, f"entities_relations_{desc_fp}.json")
+    if os.path.exists(cache_file):
+        with open(cache_file, "r") as f:
+            cache_data = json.load(f)
+            if isinstance(cache_data, dict):
+                entities = cache_data.get('entities', [])
+                relationships = cache_data.get('relationships', [])
+                return entities, relationships
+            else:
+                raise ValueError(f"Unexpected cache format in {cache_file}")
+
+    # Batching
+    table_names = list(descriptions.keys())
+    all_entities = []
+    all_relationships = []
+    for i in range(0, len(table_names), batch_size):
+        batch_tables = {k: descriptions[k] for k in table_names[i:i+batch_size]}
+        batch_fp = hashlib.md5(json.dumps(batch_tables, sort_keys=True).encode('utf-8')).hexdigest()
+        raw_file = os.path.join(cache_dir, f"entities_relations_{batch_fp}_raw.txt")
+        prompt = (
+            "You are a graph modeling expert. Given the following table descriptions, "
+            "1) Identify core entity types and their key properties. "
+            "2) Identify relationships between these entities. "
+            f"Return ONLY a valid JSON object with two keys: 'entities' (a list of entities with 'label' and 'properties'), "
+            f"and 'relationships' (a list of relationships with 'start_label', 'end_label', 'type'). "
+            f"If the output is too large, only return the first {batch_size} entities. "
+            "Do not include any explanation or markdown, just the JSON.\n"
+            "Descriptions:\n" + json.dumps(batch_tables, indent=2)
+        )
+
+        max_retries = 5
+        retry_wait = 60
+        for attempt in range(max_retries):
+            try:
+                output = llm(prompt)
+                break
+            except HTTPError as e:
+                if e.response is not None and e.response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        print(f"Rate limit hit (429). Waiting {retry_wait} seconds before retrying...")
+                        time.sleep(retry_wait)
+                        continue
+                    else:
+                        raise
+                else:
+                    raise
+        else:
+            raise RuntimeError("Max retries exceeded for LLM API.")
+
+        # Save raw LLM output before any extraction
+        with open(raw_file, "w") as f:
+            f.write(output)
+
+        # Check for empty output
+        if not output or not output.strip():
+            raise ValueError("LLM returned empty output! Please check your API key, quota, or prompt size.")
+
+        print(f"LLM output for batch {i//batch_size+1}:\n", repr(output))
+
+        # Robust JSON extraction from LLM output
+        def extract_json_from_llm_output(output: str):
+            output = output.strip()
+            if output.startswith("```json"):
+                output = output[7:]
+            if output.startswith("```"):
+                output = output[3:]
+            if output.endswith("```"):
+                output = output[:-3]
+            output = output.strip()
+            matches = list(re.finditer(r'(\{[\s\S]*\})', output))
+            if matches:
+                json_str = max(matches, key=lambda m: len(m.group(1))).group(1)
+                try:
+                    return json.loads(json_str)
+                except Exception as e:
+                    raise ValueError(f"Failed to parse extracted JSON (may be truncated): {json_str[:500]}...") from e
+            else:
+                raise ValueError(f"Failed to extract JSON from LLM output. Output was:\n{output[:500]}...")
+
+        try:
+            data = extract_json_from_llm_output(output)
+        except Exception as e:
+            print("Failed to parse LLM output as JSON.")
+            raise e
+
+        # Merge results
+        all_entities.extend(data.get('entities', []))
+        all_relationships.extend(data.get('relationships', []))
+
+    # Save merged results in the same format as describe_tables: always a dict with keys
+    with open(cache_file, "w") as f:
+        json.dump({
+            "desc_fp": desc_fp,
+            "entities": all_entities,
+            "relationships": all_relationships
+        }, f)
+
+    return all_entities, all_relationships
 
 # --------------------------------------------------
 # Cypher Generation
@@ -180,9 +288,10 @@ def build_cypher_commands(entities: List[Dict], relations: List[Dict]) -> List[s
 # --------------------------------------------------
 # Execution on Neo4j
 # --------------------------------------------------
-# def execute_cypher(commands: List[str], params: Dict[str, Any] = {}):
-#     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
-#     with driver.session() as session:
-#         for cy in commands:
-#             session.run(cy, **params)
-#     driver.close()
+from neo4j import GraphDatabase
+def execute_cypher(commands: List[str], params: Dict[str, Any] = {}):
+    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+    with driver.session() as session:
+        for cy in commands:
+            session.run(cy, **params)
+    driver.close()
