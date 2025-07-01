@@ -7,7 +7,6 @@ services:
     command: sleep infinity
     environment:
       - PYTHONUNBUFFERED=1
-    # Add any additional environment variables or ports if needed
 
   neo4j:
     image: neo4j:5
@@ -15,7 +14,7 @@ services:
       - 7687:7687
       - 7474:7474
     environment:
-      - NEO4J_AUTH=neo4j/your_password
+      - NEO4J_AUTH=neo4j/ranqarag#1
     volumes:
       - neo4j_data:/data
 
