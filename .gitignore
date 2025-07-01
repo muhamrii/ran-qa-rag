@@ -3,8 +3,9 @@ __pycache__/
 *.pyc
 
 # Environment and config files
-.env 
+.env
 .envrc
+config.env
 config.yaml
 
 # Databases and logs
