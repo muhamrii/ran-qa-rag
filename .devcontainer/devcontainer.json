@@ -1,10 +1,25 @@
 {
-  "name": "RAN QA & RAG System",
-  "dockerComposeFile": [
-    "docker-compose.yml"
+  "name": "RAN QA & RAG System (with Neo4j)",
+  // Remove "dockerComposeFile" and "service" properties
+  // "dockerComposeFile": [
+  //   "docker-compose.yml"
+  // ],
+  // "service": "devcontainer",
+
+  // --- Neo4j Configuration ---
+  "image": "neo4j:latest", // Or a specific version like "neo4j:5.16.0-community"
+  "forwardPorts": [7474, 7687], // Neo4j Browser (HTTP) and Bolt (binary) ports
+  "containerEnv": {
+    "NEO4J_AUTH": "neo4j/ranqarag#1"
+  },
+  "mounts": [
+    "source=neo4j-data,target=/data,type=volume" // Persist Neo4j data
   ],
-  "service": "devcontainer",
+  // --- End Neo4j Configuration ---
+
   "workspaceFolder": "/workspaces/ran-qa-rag",
+
+  // Merge existing Python features
   "features": {
     "ghcr.io/devcontainers/features/python:1": {}
   },
@@ -16,7 +31,8 @@
         "ms-python.vscode-pylance",
         "ms-toolsai.jupyter",
         "humao.rest-client",
-        "redhat.vscode-yaml"
+        "redhat.vscode-yaml",
+        "neo4j.vscode-neo4j" // Recommended: Neo4j VS Code extension
       ],
       "settings": {
         "python.defaultInterpreterPath": "/usr/local/bin/python",
@@ -24,5 +40,7 @@
       }
     }
   },
-  "postCreateCommand": "pip install --upgrade pip && pip install -r requirements.txt"
+
+  // Combine post-create commands, ensuring Neo4j starts first, then Python setup
+  "postCreateCommand": "neo4j-admin server start && pip install --upgrade pip && pip install -r requirements.txt"
 }
