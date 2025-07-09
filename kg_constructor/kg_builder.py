@@ -11,20 +11,6 @@ from transformers import pipeline
 #from neo4j import GraphDatabase
 
 
-
-### LOCAL LLM WRAPPER
-class LocalLLM:
-    """
-    Simple wrapper for Hugging Face text-generation pipeline to mimic OpenAI's interface.
-    """
-    def __init__(self, model_name="facebook/opt-1.3b", max_new_tokens=512):
-        self.generator = pipeline("text-generation", model=model_name, device_map="auto")
-        self.max_new_tokens = max_new_tokens
-
-    def __call__(self, prompt):
-        response = self.generator(prompt, max_new_tokens=self.max_new_tokens, do_sample=True)
-        return response[0]['generated_text'][len(prompt):].strip()
-
 # --------------------------------------------------
 # Google AI Studio LLM Wrapper (Gemini 1.5 Flash, no-cost tier)
 # --------------------------------------------------
@@ -272,6 +258,8 @@ def extract_entities_and_relations(
 # --------------------------------------------------
 # Cypher Generation
 # --------------------------------------------------
+
+
 def build_cypher_commands(entities: List[Dict], relations: List[Dict]) -> List[str]:
     cyphers = []
     for ent in entities:
@@ -295,3 +283,183 @@ def execute_cypher(commands: List[str], params: Dict[str, Any] = {}):
         for cy in commands:
             session.run(cy, **params)
     driver.close()
+
+from transformers import AutoTokenizer, AutoModel
+import torch
+
+# Load a sentence transformer model for embeddings
+tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+
+def get_embedding(text: str):
+    """
+    Generate a vector embedding for the given text using a sentence transformer.
+    """
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
+    with torch.no_grad():
+        embeddings = model(**inputs).last_hidden_state.mean(dim=1)
+    return embeddings[0].tolist()
+
+def build_cypher_commands_with_embeddings(entities: List[Dict], relations: List[Dict]) -> List[Tuple[str, Dict]]:
+    """
+    Build Cypher commands for entities and relations, including vector embeddings and descriptions.
+    Returns a list of (cypher_command, parameters) tuples.
+    """
+    cyphers = []
+    for ent in entities:
+        desc = ent.get('description', '')
+        embedding = get_embedding(desc if desc else ent.get('label', ''))
+        label = ent['label']
+        properties = ent.get('properties', {})
+        # Prepare SET clause and params
+        set_clauses = []
+        params = {}
+        for k, v in properties.items():
+            set_clauses.append(f"n.{k} = ${k}")
+            params[k] = v
+        set_clauses.append("n.embedding = $embedding")
+        set_clauses.append("n.description = $description")
+        params['embedding'] = embedding
+        params['description'] = desc
+        set_clause = ", ".join(set_clauses)
+        cypher = f"MERGE (n:{label}) SET {set_clause};"
+        cyphers.append((cypher, params))
+    for rel in relations:
+        cypher = (
+            f"MATCH (a:{rel['start_label']} {{id: $start_id}}),"
+            f" (b:{rel['end_label']} {{id: $end_id}})\n"
+            f"MERGE (a)-[r:{rel['type']}]->(b);"
+        )
+        params = {
+            "start_id": rel.get("start_id"),
+            "end_id": rel.get("end_id")
+        }
+        cyphers.append((cypher, params))
+    return cyphers
+
+def create_vector_indexes(entities: List[Dict], dim: int = 384, property_name: str = "embedding"):
+    """
+    Create vector indexes in Neo4j for all unique entity labels in the entities list.
+    """
+    from neo4j import GraphDatabase
+    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+    labels = set(ent['label'] for ent in entities)
+    with driver.session() as session:
+        for label in labels:
+            cypher = (
+                f"CREATE VECTOR INDEX entity_embedding_index_{label} IF NOT EXISTS "
+                f"FOR (n:{label}) "
+                f"ON (n.{property_name}) "
+                f"OPTIONS {{indexConfig: {{"
+                f"`vector.dimensions`: {dim}, "
+                f"`vector.similarity_function`: 'cosine'"
+                f"}}}};"
+            )
+            session.run(cypher)
+    driver.close()
+
+def execute_cypher_with_params(commands: List[Tuple[str, Dict]]):
+    """
+    Execute Cypher commands with parameters.
+    """
+    from neo4j import GraphDatabase
+    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+    with driver.session() as session:
+        for cy, params in commands:
+            session.run(cy, **params)
+    driver.close()
+
+def load_dataframes_to_neo4j(dfs: Dict[str, pd.DataFrame],
+                            entities: List[Dict],
+                            relationships: List[Dict],
+                            llm: GoogleAIStudioLLM,
+                            batch_size: int = 100):
+    """
+    Loads all DataFrame tables into Neo4j as entity nodes and relationships.
+    - For each DataFrame, creates nodes for each row, with properties and embedding/description.
+    - For each relationship, creates relationships between nodes.
+    """
+    from neo4j import GraphDatabase
+    import logging
+    
+    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+    
+    # Map entity label to DataFrame name
+    label_to_df = {ent['label']: name for name, ent in zip(dfs.keys(), entities)}
+    
+    # 1. Create entity nodes with properties, description, and embedding
+    for ent in entities:
+        label = ent['label']
+        df_name = label_to_df.get(label)
+        if not df_name or df_name not in dfs:
+            logging.warning(f"No DataFrame found for entity label {label}")
+            continue
+        df = dfs[df_name]
+        desc = ent.get('description', '')
+        for start in range(0, len(df), batch_size):
+            batch = df.iloc[start:start+batch_size]
+            for _, row in batch.iterrows():
+                raw_props = row.to_dict()
+                props = {}
+                for k, v in raw_props.items():
+                    safe_k = sanitize_key(k)
+                    props[safe_k] = clean_neo4j_value(v)
+                node_id = props.get('id') or hashlib.md5(json.dumps(props, sort_keys=True).encode('utf-8')).hexdigest()
+                props['id'] = node_id
+                if not desc:
+                    desc = f"Entity {label} with properties: {list(props.keys())}"
+                embedding = get_embedding(desc)
+                props['description'] = desc
+                props['embedding'] = embedding
+                set_clause = ", ".join([f"n.{k} = ${k}" for k in props.keys()])
+                cypher = f"MERGE (n:{label} {{id: $id}}) SET {set_clause} RETURN n;"
+                try:
+                    with driver.session() as session:
+                        session.run(cypher, **props)
+                except Exception as e:
+                    logging.error(f"Failed to insert node for {label}: {e}")
+    # 2. Create relationships
+    for rel in relationships:
+        start_label = rel['start_label']
+        end_label = rel['end_label']
+        rel_type = rel['type']
+        start_df = dfs.get(label_to_df.get(start_label, ''))
+        end_df = dfs.get(label_to_df.get(end_label, ''))
+        if start_df is None or end_df is None:
+            logging.warning(f"Missing DataFrame for relationship {rel_type} between {start_label} and {end_label}")
+            continue
+        start_ids = set(start_df['id']) if 'id' in start_df else set()
+        end_ids = set(end_df['id']) if 'id' in end_df else set()
+        common_ids = start_ids & end_ids
+        for node_id in common_ids:
+            cypher = (
+                f"MATCH (a:{start_label} {{id: $start_id}}), (b:{end_label} {{id: $end_id}}) "
+                f"MERGE (a)-[r:{rel_type}]->(b) RETURN r;"
+            )
+            params = {"start_id": node_id, "end_id": node_id}
+            try:
+                with driver.session() as session:
+                    session.run(cypher, **params)
+            except Exception as e:
+                logging.error(f"Failed to create relationship {rel_type}: {e}")
+    driver.close()
+
+def sanitize_key(key):
+    # Replace dots with underscores or just take the part after the last dot
+    return key.split('.')[-1]
+
+import numbers
+import pandas as pd
+
+def clean_neo4j_value(val):
+    if pd.isna(val):
+        return None
+    if isinstance(val, (str, bool, numbers.Number)):
+        return val
+    if isinstance(val, (list, tuple)):
+        # Only allow lists of primitives
+        if all(isinstance(x, (str, bool, numbers.Number)) or pd.isna(x) for x in val):
+            return [clean_neo4j_value(x) for x in val]
+        return str(val)
+    # For dicts, sets, or other objects, convert to string
+    return str(val)
