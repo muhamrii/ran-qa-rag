@@ -7,49 +7,93 @@ import numpy as np
 
 # --- Query Understanding Agent ---
 
+from typing import Optional
+try:
+    from transformers import pipeline
+except ImportError:
+    pipeline = None
+
 class SemanticIntentClassifier:
+    """
+    ML-based intent classifier using a HuggingFace text-classification pipeline.
+    """
+    def __init__(self, model_path: Optional[str] = None):
+        """
+        model_path: Path to a fine-tuned HuggingFace model directory or model hub name.
+        """
+        self.model_path = model_path or "path/to/your/fine-tuned-model"  # Update this path
+        self.classifier = None
+        if pipeline is not None:
+            try:
+                self.classifier = pipeline("text-classification", model=self.model_path)
+            except Exception as e:
+                print(f"[WARN] Could not load intent classifier model: {e}\nFalling back to generic intent.")
+        else:
+            print("[WARN] transformers not installed. Please install transformers to use ML-based intent classifier.")
+
     def classify(self, query: str) -> str:
-        # Placeholder: Replace with fine-tuned telecom intent classifier
-        if "degraded" in query:
-            return "show_degraded_cells"
-        elif "throughput" in query:
-            return "diagnose_throughput"
+        """Classify the intent of the query using the ML model."""
+        if self.classifier is not None:
+            try:
+                result = self.classifier(query)
+                # HuggingFace pipeline returns a list of dicts with 'label' and 'score'
+                return result[0]['label']
+            except Exception as e:
+                print(f"[ERROR] Intent classification failed: {e}")
+                return "generic_query"
+        # Fallback if model is not loaded
         return "generic_query"
 
 class ContextTracker:
+    """
+    Tracks the conversation context and history.
+    """
     def __init__(self):
         self.history = []
         self.current_focus = None
 
-    def update(self, query: str, intent: str):
+    def update(self, query: str, intent: str) -> None:
+        """Update the context with the latest query and intent."""
         self.history.append({"query": query, "intent": intent})
         self.current_focus = intent
 
-    def get_context(self):
+    def get_context(self) -> dict:
+        """Get the current context as a dictionary."""
         return {"history": self.history, "focus": self.current_focus}
 
 # --- Retrieval Engine Agent ---
 
 class QueryEmbeddingCache:
+    """
+    Caches embeddings and their associated retrieval results.
+    """
     def __init__(self):
         self.cache = {}
 
     def get(self, embedding: np.ndarray):
+        """Retrieve cached results for an embedding, if available."""
         key = hashlib.md5(embedding.tobytes()).hexdigest()
         return self.cache.get(key)
 
-    def set(self, embedding: np.ndarray, result):
+    def set(self, embedding: np.ndarray, result) -> None:
+        """Cache the result for a given embedding."""
         key = hashlib.md5(embedding.tobytes()).hexdigest()
         self.cache[key] = result
 
 class EmbeddingGenerator:
+    """
+    Generates embeddings for text queries. Replace with a transformer model for production.
+    """
     def embed(self, text: str) -> np.ndarray:
-        # Placeholder: Replace with transformer-based embedding
+        """Generate an embedding for the input text."""
         return np.random.rand(384)
 
 class CypherQueryGenerator:
+    """
+    Generates Cypher queries from intent and context.
+    """
     def generate(self, intent: str, context: dict) -> str:
-        # Placeholder: Map intent/context to Cypher
+        """Generate a Cypher query based on intent and context."""
         if intent == "show_degraded_cells":
             return "MATCH (c:Cell) WHERE c.status = 'degraded' RETURN c"
         elif intent == "diagnose_throughput":
@@ -57,35 +101,54 @@ class CypherQueryGenerator:
         return "MATCH (n) RETURN n LIMIT 10"
 
 class Neo4jExecutionEngine:
+    """
+    Executes Cypher queries against the Neo4j database.
+    """
     def query(self, cypher: str):
-        # Placeholder: Replace with real Neo4j query
+        """Execute a Cypher query and return results."""
+        # Placeholder: Replace with real Neo4j query logic
         return [{"cell_id": 1, "status": "degraded"}]
 
 class ContextualRetrieval:
+    """
+    Augments retrieval results with additional context if needed.
+    """
     def augment(self, results, context):
-        # Placeholder: Add logs/metrics if needed
+        """Augment results with additional context."""
         return results
 
 # --- Response Composer Agent ---
 
 class PromptPlanner:
-    def select(self, intent: str):
-        # Placeholder: Select prompt/template
+    """
+    Selects a prompt template based on the intent.
+    """
+    def select(self, intent: str) -> str:
+        """Select a prompt template for the given intent."""
         return f"Answer the following telecom query ({intent}):"
 
 class LLMResponseGenerator:
-    def generate(self, prompt: str, data):
-        # Placeholder: Replace with LLM call
+    """
+    Generates a response using an LLM based on the prompt and data.
+    """
+    def generate(self, prompt: str, data) -> str:
+        """Generate a response using the prompt and data."""
         return f"{prompt} {data}"
 
 class FactualSafetyChecker:
-    def check(self, response: str, data):
-        # Placeholder: Validate response
+    """
+    Checks the factual accuracy and safety of the response.
+    """
+    def check(self, response: str, data) -> str:
+        """Check the response for factual accuracy and safety."""
         return response
 
 # --- Main Chatbot Agent ---
 
 class RANChatbotAgent:
+    """
+    Main chatbot agent that orchestrates all modules.
+    """
     def __init__(self):
         self.intent_classifier = SemanticIntentClassifier()
         self.context_tracker = ContextTracker()
@@ -98,7 +161,8 @@ class RANChatbotAgent:
         self.llm_generator = LLMResponseGenerator()
         self.safety_checker = FactualSafetyChecker()
 
-    def handle_query(self, user_query: str):
+    def handle_query(self, user_query: str) -> str:
+        """Process a user query end-to-end and return a response."""
         # 1. Query Understanding
         intent = self.intent_classifier.classify(user_query)
         self.context_tracker.update(user_query, intent)

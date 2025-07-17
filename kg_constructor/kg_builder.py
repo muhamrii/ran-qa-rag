@@ -1,21 +1,20 @@
 import os
 import json
+import glob
+import csv
 import hashlib
+import time
+import requests
+from requests.exceptions import HTTPError
 from typing import Dict, List, Tuple, Any
-
 import pandas as pd
-from langchain.llms import OpenAI
-from langchain_community import llms
-from transformers import pipeline
-# from langchain.embeddings import OpenAIEmbeddings  # Uncomment if embeddings are needed
-#from neo4j import GraphDatabase
-
+from transformers import pipeline, AutoTokenizer, AutoModel
+import torch
+import yaml
 
 # --------------------------------------------------
 # Google AI Studio LLM Wrapper (Gemini 1.5 Flash, no-cost tier)
 # --------------------------------------------------
-import requests
-
 class GoogleAIStudioLLM:
     """
     Wrapper for Google AI Studio API (Gemini 1.5 Flash, no-cost tier).
@@ -36,8 +35,98 @@ class GoogleAIStudioLLM:
         response = requests.post(self.endpoint, headers=headers, json=data)
         response.raise_for_status()
         result = response.json()
-        # Extract the generated text
         return result["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../config.yaml")
+if os.path.exists(CONFIG_PATH):
+    with open(CONFIG_PATH, "r") as f:
+        config = yaml.safe_load(f)
+    GOOGLE_API_KEY = config["google_ai_studio"]["api_key"]
+    GOOGLE_MODEL = config["google_ai_studio"].get("model", "gemini-1.5-flash-latest")
+    NEO4J_URI = config["neo4j"]["uri"]
+    NEO4J_USER = config["neo4j"]["user"]
+    NEO4J_PASS = config["neo4j"]["password"]
+else:
+    raise FileNotFoundError(f"Config file not found at {CONFIG_PATH}")
+
+llm = GoogleAIStudioLLM(api_key=GOOGLE_API_KEY, model=GOOGLE_MODEL)
+CACHE_DIR = os.getenv("KG_CACHE_DIR", ".kg_cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# --------------------------------------------------
+# Chatbot Intent Training Data Generation
+# --------------------------------------------------
+def generate_intent_training_data(
+    cache_dir: str = ".kg_cache",
+    output_csv: str = "intent_training_data.csv",
+    llm: GoogleAIStudioLLM = None,
+    queries_per_entity: int = 5
+) -> str:
+    """
+    Generate a CSV training dataset for intent classification using entity descriptions from .kg_cache.
+    For each entity/table, use Gemini to generate synthetic user queries and label them with the entity intent.
+    The output CSV will have columns: text,label (query,label).
+    Args:
+        cache_dir: Directory containing .json description files.
+        output_csv: Output CSV file path.
+        llm: GoogleAIStudioLLM instance (required).
+        queries_per_entity: Number of queries to generate per entity.
+    Returns:
+        Path to the generated CSV file.
+    """
+    assert llm is not None, "You must provide a GoogleAIStudioLLM instance."
+    json_files = glob.glob(os.path.join(cache_dir, "*.json"))
+    rows = []
+    for jf in json_files:
+        with open(jf) as f:
+            data = json.load(f)
+        entity = os.path.basename(jf).split("_")[0]
+        desc = data.get("description", "")
+        if not desc:
+            continue
+        # Check for cached queries for this entity
+        queries_cache_file = os.path.join(cache_dir, f"{entity}_intent_queries.json")
+        if os.path.exists(queries_cache_file):
+            with open(queries_cache_file, "r") as qf:
+                cached = json.load(qf)
+                queries = cached.get("queries", [])
+        else:
+            prompt = (
+                f"You are a telecom expert chatbot trainer. "
+                f"Given the following entity/table description, generate {queries_per_entity} realistic user queries "
+                f"that a telecom engineer or operator might ask about this entity. "
+                f"Return only a numbered list of queries, no explanations.\n"
+                f"Entity/Table: {entity}\nDescription: {desc}"
+            )
+            try:
+                queries_text = llm(prompt)
+            except Exception as e:
+                print(f"[WARN] LLM failed for {entity}: {e}")
+                continue
+            queries = []
+            for line in queries_text.splitlines():
+                line = line.strip()
+                if line and (line[0].isdigit() or line.startswith("-") or line.startswith("•")):
+                    q = line.lstrip("0123456789.-• ")
+                    if q:
+                        queries.append(q)
+            if not queries:
+                queries = [l.strip() for l in queries_text.splitlines() if l.strip()]
+            # Save queries to cache
+            with open(queries_cache_file, "w") as qf:
+                json.dump({"entity": entity, "description": desc, "queries": queries}, qf)
+        for q in queries:
+            rows.append({"text": q, "label": f"query_about_{entity}"})
+    with open(output_csv, "w", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=["text", "label"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    print(f"[INFO] Wrote {len(rows)} rows to {output_csv} (columns: text,label)")
+    return output_csv
 # --------------------------------------------------
 # Configuration
 # --------------------------------------------------
